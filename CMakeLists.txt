@@ -30,6 +30,8 @@ endif()
 if(NOT DUOCAPTURE_DIR)
   set(DUOCAPTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 endif()
+# 统一成正斜杠：CMake 在 add_executable 里会把反斜杠当转义符（\d 之类直接报错）。
+file(TO_CMAKE_PATH "${DUOCAPTURE_DIR}" DUOCAPTURE_DIR)
 set(DUO_PLUGIN_INCLUDE "${DUOCAPTURE_DIR}/include")
 if(NOT EXISTS "${DUO_PLUGIN_INCLUDE}/duocapture/plugin/plugin_api.h")
   message(FATAL_ERROR
@@ -112,5 +114,20 @@ if(DUO_YOLO_BUILD_SELFTEST)
   target_link_libraries(yolo_selftest PRIVATE d3d11 dxgi windowscodecs ole32 uuid)
   set_target_properties(yolo_selftest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  # 验证宿主的 BoxOverlay 真的把框画上去了（不是只编译通过）。
+  # 需要 duocapture 的源码树，因为它要用到 box_overlay.cpp。
+  if(EXISTS "${DUOCAPTURE_DIR}/src/present/box_overlay.cpp")
+    add_executable(box_overlay_test tools/box_overlay_test.cpp
+      "${DUOCAPTURE_DIR}/src/present/box_overlay.cpp")
+    target_include_directories(box_overlay_test PRIVATE "${DUO_PLUGIN_INCLUDE}")
+    target_compile_definitions(box_overlay_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    target_link_libraries(box_overlay_test PRIVATE d3d11 dxgi d3dcompiler)
+    set_target_properties(box_overlay_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  else()
+    message(STATUS "跳过 box_overlay_test：找不到 duocapture 源码树")
+  endif()
 endif()
 

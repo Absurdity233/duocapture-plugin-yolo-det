@@ -14,6 +14,7 @@ on_frame（分析线程）
   → BT.709 limited → RGB → center_crop 到模型输入
   → cudaMemcpy → TensorRT enqueueV3
   → 解析 rows / chw 输出 → NMS（chw 才需要）→ 映射回原始帧像素
+  → 交给宿主合成检测框（插件不直接写画面）
 ```
 
 预处理在 CPU 上做。分析 tap 本来就是「忙则丢帧」，慢的代价是少分析几帧，
@@ -92,6 +93,19 @@ src = model / scale + crop
 输出的框坐标已换算回**原始帧像素**，调用方直接在上面画即可。
 想确认裁掉了哪一块，用 `dump=` 导出实际喂给模型的图。
 
+## 检测框绘制
+
+识别出来的框会画在呈现画面上（绿色边框），由**宿主**合成，不是插件直接写。
+
+原因是线程模型：分析线程和呈现线程共用同一张解码纹理
+（`receiver` 把同一个 `DecodedFrame` 同时交给两边），插件往纹理上写会和
+`VideoProcessorBlt` 抢同一块显存，画面会闪。所以插件只通过
+`get_overlay_boxes` 上报坐标，宿主在 `Present` 前把框叠到后备缓冲上——
+和遥测文字用的是同一条路径。
+
+这个字段是 ABI 1 之后追加的，靠 `struct_size` 做单向校验，
+所以老插件（没有该字段）仍能加载，不需要升 ABI 版本。
+
 ## 输出布局自动判定
 
 | 形状 | 布局 | 处理 |
@@ -139,6 +153,9 @@ build\yolo_selftest.exe build\plugins\duo_plugin_yolo_det.dll ^
 
 实测（640×640 输入，RTX 5070 Laptop）每帧推理 3.6–4.8 ms，
 与同模型的 onnxruntime 结果逐个对齐（类别一致，分数差 < 0.03）。
+
+`box_overlay_test.exe` 单独验证宿主的绘制：造一张全黑纹理，用已知坐标
+调 `draw()`，回读像素检查边框有颜色、框内没被涂满、框外保持透明。
 
 ## 踩过的坑
 

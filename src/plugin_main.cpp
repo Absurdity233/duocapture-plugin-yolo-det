@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -163,6 +164,10 @@ struct YoloPlugin {
   std::atomic<int> last_detections{0};
   std::atomic<double> last_infer_ms{0.0};
 
+  // 给宿主呈现线程取用的检测框快照。分析线程写、呈现线程读。
+  std::mutex overlay_mutex;
+  std::vector<DuoOverlayBox> overlay_boxes;
+
   bool ready = false;
   bool warned_no_device = false;
 };
@@ -241,6 +246,24 @@ int on_frame(void* instance, const DuoFrameView* frame) {
   const unsigned long long done = self->inferred.fetch_add(1) + 1;
   self->last_detections.store(static_cast<int>(self->detections.size()));
   self->total_detections.fetch_add(self->detections.size());
+
+  // 交给宿主画框。坐标已经是原始帧像素，宿主自己缩放到窗口。
+  {
+    std::lock_guard<std::mutex> lock(self->overlay_mutex);
+    self->overlay_boxes.clear();
+    self->overlay_boxes.reserve(self->detections.size());
+    for (const duo_yolo::Detection& d : self->detections) {
+      DuoOverlayBox box{};
+      box.x1 = d.x1;
+      box.y1 = d.y1;
+      box.x2 = d.x2;
+      box.y2 = d.y2;
+      box.score = d.score;
+      box.class_id = d.class_id;
+      box.color = 0;  // 让宿主按类别配色
+      self->overlay_boxes.push_back(box);
+    }
+  }
 
   if (self->log_interval > 0 && done % static_cast<unsigned long long>(self->log_interval) == 0) {
     char buf[320];
@@ -331,6 +354,22 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
   return 0;
 }
 
+// 呈现线程调用：拷贝一份框给宿主。
+int get_overlay_boxes(void* instance, DuoOverlayBox* out_boxes, int max_boxes) {
+  if (instance == nullptr || out_boxes == nullptr || max_boxes <= 0) {
+    return 0;
+  }
+  auto* self = static_cast<YoloPlugin*>(instance);
+  std::lock_guard<std::mutex> lock(self->overlay_mutex);
+  const int count = static_cast<int>(self->overlay_boxes.size()) > max_boxes
+                        ? max_boxes
+                        : static_cast<int>(self->overlay_boxes.size());
+  for (int i = 0; i < count; ++i) {
+    out_boxes[i] = self->overlay_boxes[static_cast<std::size_t>(i)];
+  }
+  return count;
+}
+
 const DuoAnalysisPlugin* as_analysis(void* instance) {
   if (instance == nullptr) {
     return nullptr;
@@ -342,6 +381,7 @@ const DuoAnalysisPlugin* as_analysis(void* instance) {
       &on_frame,
       &on_reset,
       &destroy_instance,
+      &get_overlay_boxes,  // ABI 1 之后追加；老宿主按 struct_size 忽略它
   };
   return &api;
 }
