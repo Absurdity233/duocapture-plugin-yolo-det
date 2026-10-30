@@ -37,7 +37,7 @@ void Nv12FrameReader::reset() {
 }
 
 bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
-                           ID3D11Texture2D* src, Preprocess mode, int dst_w, int dst_h,
+                           ID3D11Texture2D* src, int dst_w, int dst_h,
                            std::vector<float>& out_nchw, FrameGeometry& geom,
                            std::string& error) {
   if (device == nullptr || context == nullptr || src == nullptr) {
@@ -97,11 +97,7 @@ bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
   const int src_h = static_cast<int>(src_desc.Height);
   const auto* uv_plane = y_plane + pitch * static_cast<std::size_t>(src_h);
 
-  geom = make_geometry(mode, src_w, src_h, dst_w, dst_h);
-
-  const bool letterbox = mode == Preprocess::kLetterbox;
-  // 灰边只对 letterbox 有意义；center_crop 的输出每一格都有真实像素。
-  const float fill = 114.0f / 255.0f;
+  geom = make_geometry(src_w, src_h, dst_w, dst_h);
 
   out_nchw.resize(static_cast<std::size_t>(3) * dst_w * dst_h);
   float* out_r = out_nchw.data();
@@ -110,22 +106,16 @@ bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
 
   const YuvToRgb conv;
   const float inv_scale = 1.0f / geom.scale;
-  const int content_x1 = static_cast<int>(geom.pad_x);
-  const int content_y1 = static_cast<int>(geom.pad_y);
-  const int resized_w = letterbox ? static_cast<int>(std::lround(geom.crop_w * geom.scale)) : dst_w;
-  const int resized_h = letterbox ? static_cast<int>(std::lround(geom.crop_h * geom.scale)) : dst_h;
-  const int content_x2 = content_x1 + resized_w;
-  const int content_y2 = content_y1 + resized_h;
 
   const int chroma_w = (src_w + 1) / 2;
   const int chroma_h = (src_h + 1) / 2;
 
   // 采样坐标只跟输出列有关，每一列算一次。公式与 to_source_x 一致：
-  //   src_x = (model_x - pad_x) / scale + crop_x
-  std::vector<int> col_x0(static_cast<std::size_t>(resized_w));
-  std::vector<float> col_wx(static_cast<std::size_t>(resized_w));
-  for (int i = 0; i < resized_w; ++i) {
-    float sx = (static_cast<float>(i) + 0.5f - geom.pad_x) * inv_scale + geom.crop_x - 0.5f;
+  //   src_x = model_x / scale + crop_x
+  std::vector<int> col_x0(static_cast<std::size_t>(dst_w));
+  std::vector<float> col_wx(static_cast<std::size_t>(dst_w));
+  for (int i = 0; i < dst_w; ++i) {
+    float sx = (static_cast<float>(i) + 0.5f) * inv_scale + geom.crop_x - 0.5f;
     sx = std::clamp(sx, 0.0f, static_cast<float>(src_w - 1));
     const int x0 = static_cast<int>(sx);
     col_x0[static_cast<std::size_t>(i)] = std::min(x0, src_w - 1);
@@ -134,14 +124,8 @@ bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
 
   for (int y = 0; y < dst_h; ++y) {
     const std::size_t row = static_cast<std::size_t>(y) * dst_w;
-    if (letterbox && (y < content_y1 || y >= content_y2)) {
-      std::fill(out_r + row, out_r + row + dst_w, fill);
-      std::fill(out_g + row, out_g + row + dst_w, fill);
-      std::fill(out_b + row, out_b + row + dst_w, fill);
-      continue;
-    }
 
-    float sy = (static_cast<float>(y) + 0.5f - geom.pad_y) * inv_scale + geom.crop_y - 0.5f;
+    float sy = (static_cast<float>(y) + 0.5f) * inv_scale + geom.crop_y - 0.5f;
     sy = std::clamp(sy, 0.0f, static_cast<float>(src_h - 1));
     const int y0 = std::min(static_cast<int>(sy), src_h - 1);
     const int y1 = std::min(y0 + 1, src_h - 1);
@@ -154,20 +138,10 @@ bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
     const int cy = std::clamp(y0 / 2, 0, chroma_h - 1);
     const unsigned char* row_uv = uv_plane + static_cast<std::size_t>(cy) * pitch;
 
-    for (int x = 0; x < content_x1; ++x) {
-      out_r[row + x] = fill;
-      out_g[row + x] = fill;
-      out_b[row + x] = fill;
-    }
-
-    for (int i = 0; i < resized_w; ++i) {
-      const int x = content_x1 + i;
-      if (x >= dst_w) {
-        break;
-      }
-      const int x0 = col_x0[static_cast<std::size_t>(i)];
+    for (int x = 0; x < dst_w; ++x) {
+      const int x0 = col_x0[static_cast<std::size_t>(x)];
       const int x1 = std::min(x0 + 1, src_w - 1);
-      const float wx = col_wx[static_cast<std::size_t>(i)];
+      const float wx = col_wx[static_cast<std::size_t>(x)];
 
       // 亮度：4 点双线性
       const float top = row_y0[x0] * (1.0f - wx) + row_y0[x1] * wx;
@@ -189,12 +163,6 @@ bool Nv12FrameReader::read(ID3D11Device* device, ID3D11DeviceContext* context,
       out_r[idx] = r;
       out_g[idx] = g;
       out_b[idx] = b;
-    }
-
-    for (int x = content_x2; x < dst_w; ++x) {
-      out_r[row + x] = fill;
-      out_g[row + x] = fill;
-      out_b[row + x] = fill;
     }
   }
 

@@ -6,9 +6,10 @@
 //   3. LoadLibrary 插件 → duo_plugin_entry → create → as_analysis → on_frame
 //   4. 把插件日志打到控制台
 //
-// 用法：yolo_selftest <plugin.dll> <image.jpg|png> "<plugin-config>" [画布宽 画布高]
+// 用法：yolo_selftest <plugin.dll> <image.jpg|png> "<plugin-config>"
 //
-// 给了画布尺寸时会把图片居中贴到品红画布上，用来验证 center_crop 的裁剪边界。
+// 给了画布尺寸（第 4、5 个参数）时会把图片居中贴到品红画布上，
+// 用来人工确认 center_crop 到底裁掉了哪一块。
 
 #include <cstdio>
 #include <cstdlib>

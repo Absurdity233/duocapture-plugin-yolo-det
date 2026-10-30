@@ -11,7 +11,7 @@ DuoCapture 的分析插件：把 A 端解码出来的每一帧喂给 TensorRT �
 ```
 on_frame（分析线程）
   → NV12 纹理 → 暂存纹理 CopyResource → Map
-  → BT.709 limited → RGB → center_crop / letterbox 到模型输入
+  → BT.709 limited → RGB → center_crop 到模型输入
   → cudaMemcpy → TensorRT enqueueV3
   → 解析 rows / chw 输出 → NMS（chw 才需要）→ 映射回原始帧像素
 ```
@@ -65,7 +65,6 @@ duocapv.exe --play --peer 192.168.10.1 ^
 | `trt` | — | `nvinfer_10.dll` 的完整路径（**必填**） |
 | `input` | `images` | 输入张量名 |
 | `output` | 自动 | 输出张量名，空 = 取第一个输出 |
-| `crop` | `center_crop` | 预处理：`center_crop` 或 `letterbox` |
 | `conf` | `0.45` | 置信度阈值 |
 | `iou` | `0.45` | NMS IoU 阈值（只有 chw 布局用得上） |
 | `stride` | `6` | rows 布局每行的 float 数 |
@@ -77,24 +76,21 @@ duocapv.exe --play --peer 192.168.10.1 ^
 | `log` | `120` | 每 N 次推理打一条统计日志，`0` = 不打 |
 | `dump` | — | 把第一次推理的输入导出成 PPM，用于核对预处理 |
 
-## 两种预处理模式
+## 预处理：center_crop
 
-| | center_crop（默认） | letterbox |
-|---|---|---|
-| 做法 | 裁掉中心正方形以外的部分再缩放 | 整帧等比缩放 + 居中补 114 灰边 |
-| 视野 | 只有中心区域 | 完整画面 |
-| 目标大小 | 更大，更易检出 | 更小 |
-| 边缘目标 | **看不见** | 能看见 |
-| 坐标反算 | `(model - 0) / scale + crop_x` | `(model - pad) / scale` |
+取与模型输入同长宽比的中心区域，等比缩放到模型尺寸。不补边，
+模型输入的每一格都来自真实像素。
 
-1920×1080 送 640×640 时，center_crop 只保留中心 **1080×1080** 的正方形
-（占原宽 59%），左右各丢 420 像素。实测 dump 出来的模型输入里，
-内容区位于 x/y 130–509；letterbox 则是满宽 0–639。
+```
+src = model / scale + crop
+```
 
-两者输出都换算回**原始帧像素**，调用方无需区分。
+**注意视野损失。** 1920×1080 送 640×640 时只保留中心 **1080×1080**
+的正方形（占原宽 59%），左右各丢 420 像素。落在裁剪区外的目标
+永远不会被检出。
 
-选型建议：只关心画面中心（比如看准星附近）用 `center_crop`，目标更大、更容易检出；
-要让整个画面都在监控范围内用 `letterbox`。
+输出的框坐标已换算回**原始帧像素**，调用方直接在上面画即可。
+想确认裁掉了哪一块，用 `dump=` 导出实际喂给模型的图。
 
 ## 输出布局自动判定
 
@@ -119,8 +115,8 @@ YOLO26m，只作为「插件输出与 onnxruntime 一致」的证据，不是必
 
 ## 与 onnxruntime 对拍
 
-**预处理模式会影响分数。** 同一张 1920×1080 图上，center_crop 给同一目标的
-分数高于 letterbox——因为前者把目标放大了。对比不同来源的分数前先确认模式一致。
+**裁剪会放大目标。** 同一目标在 center_crop 输入里占的像素比整帧缩放时多，
+所以分数会偏高。拿本插件和别的工具对比分数前，先确认对方也是 center_crop。
 
 **对拍要用同一份输入像素。** 拿原图分别跑 onnxruntime 和插件，
 两边各自 `resize` 的插值算法不同（OpenCV INTER_LINEAR vs 插件双线性），

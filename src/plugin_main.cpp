@@ -5,7 +5,7 @@
 // （docs/compliance.md）在这里保持不变：只看不控。
 //
 // 数据流：
-//   on_frame(分析线程) → NV12 纹理 → Map 回读 → center_crop / letterbox + RGB
+//   on_frame(分析线程) → NV12 纹理 → Map 回读 → center_crop + RGB
 //   → TensorRT（CUDA）→ 解析 rows / chw 输出 → NMS → 原始帧坐标
 //
 // 输出格式有两种，按引擎的输出形状自动判定：
@@ -15,7 +15,6 @@
 // 配置（--plugin-config，逗号分隔的 key=value）：
 //   engine=<path>            .engine 文件（必填）
 //   trt=<path>               nvinfer_10.dll 完整路径（必填）
-//   crop=center_crop         预处理：center_crop（默认）或 letterbox
 //   input=images             输入张量名
 //   output=output0           输出张量名，空 = 自动
 //   conf=0.45                置信度阈值
@@ -153,7 +152,6 @@ struct YoloPlugin {
   std::vector<duo_yolo::Detection> detections;
   std::vector<std::string> class_names;
 
-  duo_yolo::Preprocess preprocess = duo_yolo::Preprocess::kCenterCrop;
   int every = 1;
   int log_interval = 120;
   std::string dump_path;
@@ -206,8 +204,7 @@ int on_frame(void* instance, const DuoFrameView* frame) {
 
   duo_yolo::FrameGeometry geom;
   std::string error;
-  if (!self->reader.read(device, context, texture, self->preprocess, w, h, self->input, geom,
-                         error)) {
+  if (!self->reader.read(device, context, texture, w, h, self->input, geom, error)) {
     self->failed.fetch_add(1);
     log_warn("yolo_det: 读帧失败: " + error);
     return -1;
@@ -308,9 +305,6 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
   dc.device_index = std::atoi(get("device", "0").c_str());
   dc.keep_classes = parse_int_list(get("classes", ""));
 
-  self->preprocess = get("crop", "center_crop") == "letterbox"
-                         ? duo_yolo::Preprocess::kLetterbox
-                         : duo_yolo::Preprocess::kCenterCrop;
   self->class_names = parse_str_list(get("names", ""));
   self->every = std::max(1, std::atoi(get("every", "1").c_str()));
   self->log_interval = std::max(0, std::atoi(get("log", "120").c_str()));
@@ -327,10 +321,8 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
   self->ready = true;
 
   char buf[320];
-  std::snprintf(buf, sizeof(buf), "yolo_det: 就绪，输入 %dx%d，预处理 %s，conf %.2f，每 %d 帧推理一次",
+  std::snprintf(buf, sizeof(buf), "yolo_det: 就绪，输入 %dx%d（center_crop），conf %.2f，每 %d 帧推理一次",
                 self->detector.input_width(), self->detector.input_height(),
-                self->preprocess == duo_yolo::Preprocess::kCenterCrop ? "center_crop"
-                                                                      : "letterbox",
                 static_cast<double>(dc.conf_threshold), self->every);
   log_info(buf);
   log_info("yolo_det: IO = " + self->detector.io_summary());
