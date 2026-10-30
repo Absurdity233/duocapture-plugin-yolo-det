@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # 没有 TensorRT 也必须能编过：插件在这种情况下降级成「init 返回失败」，
+  # 这正好是 CI 机器和大部分用户的环境。
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      # 需要主仓库的 include/duocapture/plugin/plugin_api.h（纯 C ABI 头文件，
+      # 不链接主程序）。插件的构建在任何 TensorRT 代码之外只依赖这一个头。
+      - name: Checkout duocapture headers
+        uses: actions/checkout@v4
+        with:
+          repository: Absurdity233/duocapture
+          path: duocapture
+
+      - name: Configure
+        run: cmake -S plugin -B build -DDUOCAPTURE_DIR="${{ github.workspace }}/duocapture"
+
+      - name: Build
+        run: cmake --build build --config Release
