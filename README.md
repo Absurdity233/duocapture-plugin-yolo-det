@@ -50,9 +50,9 @@ CI 和没装 TensorRT 的机器不会因此挂掉。
 
 ```bat
 duocapv.exe --play --peer 192.168.10.1 ^
-  --plugin-dir F:\duocapture\plugins\yolo_det\build\plugins ^
+  --plugin-dir plugins\yolo_det\build\plugins ^
   --plugin duo.yolo_det ^
-  --plugin-config "engine=F:/models/mizore_640.engine,trt=F:/TensorRT-10.16.1.11/bin/nvinfer_10.dll,conf=0.45,names=body|head,log=60"
+  --plugin-config "engine=<模型>.engine,trt=<TensorRT>\bin\nvinfer_10.dll,conf=0.45,names=body|head,log=60"
 ```
 
 ## 配置项
@@ -103,43 +103,24 @@ duocapv.exe --play --peer 192.168.10.1 ^
 | `[1, N, 5..8]` | rows | 模型已做完 NMS，直接取 `[x1,y1,x2,y2,score,cls]` |
 | `[1, 4+nc, N]` | chw | 逐候选挑最大类 + 自己做 NMS |
 
-`rows` 是 YOLOv8/10/26 的默认导出格式。仓库自带的
-`Mizore_5070_v26m_640` 和下面这两个参考模型都是 `[1,300,6]`。
+`rows` 是 YOLOv8/10/26 的默认导出格式。
 
-## 参考模型（6AY_v26m_1007）
+## 模型文件
 
-来源：`C:\Users\Absurdity\Downloads\6AY_v26m_1007_{640x640,416x416}.onnx`
-（Ultralytics YOLO26m，训练集 `DF_0130`，导出 2026-10-04）
-
-| | 输入 | 输出 | 类别 |
-|---|---|---|---|
-| `6AY_v26m_1007_640x640` | `[1,3,640,640]` | `[1,300,6]` | 7 类（`[1,7,8400]` 中间张量） |
-| `6AY_v26m_1007_416x416` | `[1,3,416,416]` | `[1,300,6]` | 7 类 |
-
-转换好的引擎（FP16，`trtexec`）：
-
-```bat
-models\6AY_v26m_640.engine   43.6 MB   GPU 3.45 ms 中位
-models\6AY_v26m_416.engine   43.0 MB   GPU 2.97 ms 中位
-```
+仓库**不包含**任何模型或引擎——每个引擎约 43 MB，且与本机的 GPU 和
+TensorRT 版本绑定，换台机器就得重转。用你自己的 ONNX 导出即可：
 
 ```bat
 trtexec.exe --onnx=<model>.onnx --saveEngine=<model>.engine --fp16
 ```
 
-已知类别：`0=body 1=head 2=teammate`，其余 3–6 在这批验证图上没出现过。
+下文的对拍数据来自一个 7 类（`body` / `head` / `teammate` 等）的
+YOLO26m，只作为「插件输出与 onnxruntime 一致」的证据，不是必需的模型。
 
-实测（验证集图片，conf 0.25）：
+## 与 onnxruntime 对拍
 
-| 图片 | 模型 | 插件 | onnxruntime |
-|---|---|---|---|
-| 0808c4e6 | 640 | teammate 0.903 @ [239,233]-[262,294] | 0.900 @ [239,233]-[262,294] |
-| 0808c4e6 | 416 | teammate 0.900 @ [238,234]-[263,294] | 0.904 @ [239,234]-[262,295] |
-| 0f1a114f | 640 | body 0.949 / head 0.891 | 0.950 / 0.901 |
-| 0f1a114f | 416 | body 0.953 / head 0.863 | 0.953 / 0.878 |
-
-**预处理模式会影响分数。** 同一张 1920×1080 图上，center_crop 给 body 0.952，
-letterbox 给 0.927——因为前者把目标放大了。对比不同来源的分数前先确认模式一致。
+**预处理模式会影响分数。** 同一张 1920×1080 图上，center_crop 给同一目标的
+分数高于 letterbox——因为前者把目标放大了。对比不同来源的分数前先确认模式一致。
 
 **对拍要用同一份输入像素。** 拿原图分别跑 onnxruntime 和插件，
 两边各自 `resize` 的插值算法不同（OpenCV INTER_LINEAR vs 插件双线性），
@@ -153,8 +134,8 @@ letterbox 给 0.927——因为前者把目标放大了。对比不同来源的�
 
 ```bat
 build\yolo_selftest.exe build\plugins\duo_plugin_yolo_det.dll ^
-  F:\Delta_YOLO26\delta_dataset_merged\val\images\some.jpg ^
-  "engine=F:/models/mizore_640.engine,trt=F:/TensorRT-10.16.1.11/bin/nvinfer_10.dll,conf=0.35,log=1,names=body|head"
+  <图片路径> ^
+  "engine=<模型>.engine,trt=<TensorRT>\bin\nvinfer_10.dll,conf=0.35,log=1,names=body|head"
 ```
 
 它做的事和主程序一致：建 D3D11 设备 → 图片转 NV12 纹理 → 加载 DLL →
