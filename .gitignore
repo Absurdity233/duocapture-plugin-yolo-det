@@ -1,0 +1,16 @@
+# 独立插件工程的构建产物。
+# 注意：本文件只作用于 plugins/yolo_det 这个独立仓库，
+# 不影响 duocapture 主仓库的 .gitignore。
+build/
+build_*/
+*.user
+CMakeUserPresets.json
+
+# 模型与转换好的引擎都不入库：每个引擎 43 MB，而且与本机 GPU/TRT 版本绑定。
+# 需要时用 README 里的 trtexec 命令重新生成。
+models/*.engine
+models/*.onnx
+
+# 调试导出
+*.ppm
+*.nv12
