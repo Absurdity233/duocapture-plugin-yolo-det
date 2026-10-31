@@ -326,7 +326,7 @@ bool YoloDetector::init(const DetectConfig& config, LogFn log, std::string& erro
   const std::size_t in_elements = dims_volume(in_dims.d, in_dims.nbDims);
   const std::size_t out_elements = dims_volume(out_dims.d, out_dims.nbDims);
   if (in_elements == 0 || out_elements == 0) {
-    error = "引擎用了动态形状，本插件暂不支持（请导出固定 640x640 的引擎）";
+    error = "引擎用了动态形状，本插件暂不支持（请导出固定输入尺寸的引擎）";
     return false;
   }
 
