@@ -296,6 +296,12 @@ void on_reset(void* instance) {
   auto* self = static_cast<YoloPlugin*>(instance);
   self->reader.reset();
   self->frames.store(0);
+  // 旧流的检测框必须一起丢掉：坐标是相对上一段流的，重置后继续画会
+  // 停在错误的位置（尤其是断流后不再推理，宿主仍会每帧画这些旧框）。
+  {
+    std::lock_guard<std::mutex> lock(self->overlay_mutex);
+    self->overlay_boxes.clear();
+  }
   log_info("yolo_det: 流已重置");
 }
 
@@ -334,6 +340,7 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
   self->dump_path = get("dump", "");
 
   std::string error;
+  const auto init_begin = std::chrono::steady_clock::now();
   if (!self->detector.init(dc, &trt_log, error)) {
     // 初始化失败仍然返回实例：这样配置错了能在日志里看到原因，
     // 而不是静默地「插件没加载」。
@@ -341,11 +348,16 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
     *out_instance = self;
     return 0;
   }
+  const double init_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - init_begin)
+          .count();
   self->ready = true;
 
   char buf[320];
-  std::snprintf(buf, sizeof(buf), "yolo_det: 就绪，输入 %dx%d（center_crop），conf %.2f，每 %d 帧推理一次",
-                self->detector.input_width(), self->detector.input_height(),
+  std::snprintf(buf, sizeof(buf),
+                "yolo_det: 就绪（引擎加载 + 预热 %.0f ms），输入 %dx%d（center_crop），"
+                "conf %.2f，每 %d 帧推理一次",
+                init_ms, self->detector.input_width(), self->detector.input_height(),
                 static_cast<double>(dc.conf_threshold), self->every);
   log_info(buf);
   log_info("yolo_det: IO = " + self->detector.io_summary());

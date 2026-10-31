@@ -330,6 +330,21 @@ bool YoloDetector::init(const DetectConfig& config, LogFn log, std::string& erro
     return false;
   }
 
+  // 类型必须是 FP32。整个预处理 / 拷贝链路都按 float 写，遇到 FP16
+  // 或 INT8 的 IO 张量会按 4 字节/元素分配，但 TensorRT 只写 2/1 字节，
+  // 反过来也会把输入解释错。这里直接拒绝，不要带着错误假设跑。
+  const nvinfer1::DataType in_type = impl_->engine->getTensorDataType(input_name);
+  const nvinfer1::DataType out_type = impl_->engine->getTensorDataType(output_name);
+  if (in_type != nvinfer1::DataType::kFLOAT || out_type != nvinfer1::DataType::kFLOAT) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "张量类型必须是 FP32（输入=%d 输出=%d）。"
+                  "请用 trtexec 不指定 --inputIOFormats/--outputIOFormats，或导出 FP32 ONNX",
+                  static_cast<int>(in_type), static_cast<int>(out_type));
+    error = buf;
+    return false;
+  }
+
   if (in_dims.nbDims != 4 || in_dims.d[1] != 3) {
     error = "输入不是 NCHW 的 [1,3,H,W]，无法处理: " + summary;
     return false;
@@ -374,6 +389,27 @@ bool YoloDetector::init(const DetectConfig& config, LogFn log, std::string& erro
   if (cudaStreamCreateWithFlags(&impl_->stream, cudaStreamNonBlocking) != cudaSuccess) {
     error = "创建 CUDA 流失败";
     return false;
+  }
+
+  // 预热。第一次 enqueueV3 要建内核句柄、初始化 CUDA 上下文，
+  // 实测首帧 8-14 ms，稳定后 3.9 ms。这几十毫秒不该算在分析线程的
+  // 第一帧上——那会白白丢掉开局的一两帧。这里跑两次空推理提前付掉。
+  {
+    std::vector<float> warm(in_elements, 0.5f);
+    if (!impl_->context->setInputTensorAddress(input_name, impl_->device_input) ||
+        !impl_->context->setOutputTensorAddress(output_name, impl_->device_output)) {
+      error = "预热前设置张量地址失败";
+      return false;
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+      if (cudaMemcpyAsync(impl_->device_input, warm.data(), warm.size() * sizeof(float),
+                          cudaMemcpyHostToDevice, impl_->stream) != cudaSuccess ||
+          !impl_->context->enqueueV3(impl_->stream) ||
+          cudaStreamSynchronize(impl_->stream) != cudaSuccess) {
+        error = "预热推理失败";
+        return false;
+      }
+    }
   }
   return true;
 }
