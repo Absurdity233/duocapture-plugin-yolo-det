@@ -15,8 +15,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+# 默认 Release 而不是 Debug：这个插件是拿来跑实时推理的，
+# Debug（/Od /RTC1）下预处理能慢到 30 ms/帧，完全没法用。
+# 注意必须在这里 FORCE 掉——本机的 CMake 会在 project() 之前就把
+# CMAKE_BUILD_TYPE 设成 Debug（最小工程也一样能复现），
+# 所以不能靠 "if(NOT CMAKE_BUILD_TYPE)" 判断。
+if(NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
 if(MSVC)

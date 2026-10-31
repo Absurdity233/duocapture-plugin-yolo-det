@@ -161,8 +161,15 @@ struct YoloPlugin {
   std::atomic<unsigned long long> inferred{0};
   std::atomic<unsigned long long> failed{0};
   std::atomic<unsigned long long> total_detections{0};
-  std::atomic<int> last_detections{0};
-  std::atomic<double> last_infer_ms{0.0};
+
+  // 耗时统计。只在分析线程里读写，不需要原子量。
+  // 这台机器上 GPU 时钟波动很大（同一帧实测 5.6-9.7 ms），单帧数字没有
+  // 参考价值，所以按日志窗口累计，报均值和峰值。
+  double pre_ms_sum = 0.0;
+  double infer_ms_sum = 0.0;
+  double pre_ms_max = 0.0;
+  double infer_ms_max = 0.0;
+  unsigned long long window_count = 0;
 
   // 给宿主呈现线程取用的检测框快照。分析线程写、呈现线程读。
   std::mutex overlay_mutex;
@@ -209,11 +216,15 @@ int on_frame(void* instance, const DuoFrameView* frame) {
 
   duo_yolo::FrameGeometry geom;
   std::string error;
+  const auto pre_begin = std::chrono::steady_clock::now();
   if (!self->reader.read(device, context, texture, w, h, self->input, geom, error)) {
     self->failed.fetch_add(1);
     log_warn("yolo_det: 读帧失败: " + error);
     return -1;
   }
+  const double pre_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre_begin)
+          .count();
 
   // 调试用：把真正喂给模型的图导出成 PPM，用来对比预处理是否符合预期。
   if (!self->dump_path.empty() && self->dump_written < 1) {
@@ -241,11 +252,15 @@ int on_frame(void* instance, const DuoFrameView* frame) {
   const auto t1 = std::chrono::steady_clock::now();
   const double ms =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
-  self->last_infer_ms.store(ms);
 
   const unsigned long long done = self->inferred.fetch_add(1) + 1;
-  self->last_detections.store(static_cast<int>(self->detections.size()));
   self->total_detections.fetch_add(self->detections.size());
+
+  self->pre_ms_sum += pre_ms;
+  self->infer_ms_sum += ms;
+  self->pre_ms_max = std::max(self->pre_ms_max, pre_ms);
+  self->infer_ms_max = std::max(self->infer_ms_max, ms);
+  ++self->window_count;
 
   // 交给宿主画框。坐标已经是原始帧像素，宿主自己缩放到窗口。
   {
@@ -266,10 +281,17 @@ int on_frame(void* instance, const DuoFrameView* frame) {
   }
 
   if (self->log_interval > 0 && done % static_cast<unsigned long long>(self->log_interval) == 0) {
-    char buf[320];
-    std::snprintf(buf, sizeof(buf), "yolo_det: 第 %llu 帧，%zu 个目标，推理 %.2f ms（累计 %llu 个）",
-                  done, self->detections.size(), ms, self->total_detections.load());
+    const double samples = static_cast<double>(std::max(1ull, self->window_count));
+    char buf[400];
+    std::snprintf(buf, sizeof(buf),
+                  "yolo_det: 第 %llu 帧，%zu 个目标｜预处理 均%.2f 峰%.2f ms"
+                  "｜推理 均%.2f 峰%.2f ms｜累计 %llu 个目标",
+                  done, self->detections.size(), self->pre_ms_sum / samples, self->pre_ms_max,
+                  self->infer_ms_sum / samples, self->infer_ms_max, self->total_detections.load());
     log_info(buf);
+    self->pre_ms_sum = self->infer_ms_sum = 0.0;
+    self->pre_ms_max = self->infer_ms_max = 0.0;
+    self->window_count = 0;
 
     // 顺带把这一帧每个目标的类名/置信度/中心点打出来，方便核对模型输出对不对。
     for (const duo_yolo::Detection& d : self->detections) {
