@@ -62,7 +62,7 @@ duocapv.exe --play --peer 192.168.10.1 ^
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `engine` | — | `.engine` 文件路径（**必填**） |
+| `engine` | — | `.engine` 或 `.onnx` 路径（**必填**） |
 | `trt` | — | `nvinfer_10.dll` 的完整路径（**必填**） |
 | `input` | `images` | 输入张量名 |
 | `output` | 自动 | 输出张量名，空 = 取第一个输出 |
@@ -76,6 +76,51 @@ duocapv.exe --play --peer 192.168.10.1 ^
 | `every` | `1` | 每 N 帧推理一次（降频省 GPU） |
 | `log` | `120` | 每 N 次推理打一条统计日志，`0` = 不打 |
 | `dump` | — | 把第一次推理的输入导出成 PPM，用于核对预处理 |
+
+## 直接给 ONNX
+
+`engine=` 可以直接指向 `.onnx`，插件会在首次加载时把它编成引擎：
+
+```
+yolo_det: 首次加载 ONNX，正在构建 TensorRT 引擎（可能需要几分钟）…
+yolo_det: 引擎已构建并缓存到 <onnx>.engine
+yolo_det: 就绪（引擎加载 + 预热 57805 ms）
+```
+
+之后每次启动直接读缓存（约 0.3 s）。缓存的判断依据是**文件修改时间**：
+ONNX 比 `.engine` 新就自动重编，不用手动删。缓存位置默认是
+`<onnx 路径>.engine`，用 `cache=` 可以改到别处。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `trtexec` | 同目录的 `trtexec.exe` | 回退构建器路径 |
+| `onnxparser` | 同目录的 `nvonnxparser_10.dll` | 解析器路径 |
+| `cache` | `<onnx>.engine` | 引擎缓存路径 |
+| `fp16` | `1` | 构建时允许 FP16 层 |
+| `workspace` | `2048` | 构建时工作区上限（MB） |
+| `rebuild` | `0` | `1` = 忽略缓存强制重编 |
+
+**构建分两条路。** 优先用内置 builder（`nvonnxparser` + `IBuilder`，纯 API、
+不开子进程）。但对带内置 NMS 的 YOLO26 模型，内置路径会撞上 classic builder
+的 shape 推断限制：
+
+```
+IElementWiseLayer /model.23/Sub: broadcast dimensions must be conformable
+```
+
+trtexec 没有这个问题，因为它走的是 compiler backend（日志里那句
+"Compiler backend is used during engine build."），而这个后端目前没有
+公开的 API 开关。所以内置构建失败后会自动改用同目录的 `trtexec.exe`：
+
+```
+[WARN] yolo_det: 内置构建失败，改用 trtexec 重建（…）
+```
+
+两条路都失败时，错误信息里会分别列出两边的失败原因。实测 416 模型走
+trtexec 约 58 s，640 模型更久一些。
+
+**注意**：用 trtexec 构建意味着 `trtexec.exe` 必须和 `nvinfer_10.dll` 在同一
+目录（TensorRT 官方包就是这样），或者用 `trtexec=` 显式指定。
 
 ## 预处理：center_crop
 

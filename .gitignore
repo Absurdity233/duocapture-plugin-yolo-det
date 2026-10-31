@@ -14,3 +14,6 @@ models/*.onnx
 # 调试导出
 *.ppm
 *.nv12
+
+# ONNX 现编生成的缓存（<onnx>.engine）
+*.onnx.engine

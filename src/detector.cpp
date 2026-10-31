@@ -1,9 +1,13 @@
 #include "detector.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -21,6 +25,7 @@
 
 #if defined(DUO_YOLO_HAVE_TENSORRT)
 #include <NvInfer.h>
+#include <NvOnnxParser.h>
 #include <cuda_runtime_api.h>
 #endif
 
@@ -91,6 +96,8 @@ class TrtLogger final : public nvinfer1::ILogger {
 };
 
 using CreateInferRuntimeFn = void* (*)(void* logger, int32_t version);
+using CreateInferBuilderFn = void* (*)(void* logger, int32_t version);
+using CreateNvOnnxParserFn = void* (*)(void* network, void* logger, int32_t version);
 
 // TRT 接口对象的析构是 protected 的，只能 delete 指针本身。
 template <typename T>
@@ -99,6 +106,396 @@ void trt_release(T*& ptr) {
     delete ptr;
     ptr = nullptr;
   }
+}
+
+bool ends_with_ci(const std::string& text, const char* suffix) {
+  const std::size_t n = std::strlen(suffix);
+  if (text.size() < n) {
+    return false;
+  }
+  const std::size_t off = text.size() - n;
+  for (std::size_t i = 0; i < n; ++i) {
+    const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(text[off + i])));
+    const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(suffix[i])));
+    if (a != b) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool read_file(const std::string& path, std::vector<char>& out, std::string& error) {
+  FILE* fp = nullptr;
+  if (::fopen_s(&fp, path.c_str(), "rb") != 0 || fp == nullptr) {
+    error = "打不开文件: " + path;
+    return false;
+  }
+  std::fseek(fp, 0, SEEK_END);
+  const long size = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  if (size <= 0) {
+    std::fclose(fp);
+    error = "文件为空: " + path;
+    return false;
+  }
+  out.resize(static_cast<std::size_t>(size));
+  const bool ok = std::fread(out.data(), 1, out.size(), fp) == out.size();
+  std::fclose(fp);
+  if (!ok) {
+    error = "读取文件失败: " + path;
+    return false;
+  }
+  return true;
+}
+
+bool write_file(const std::string& path, const void* data, std::size_t size) {
+  FILE* fp = nullptr;
+  if (::fopen_s(&fp, path.c_str(), "wb") != 0 || fp == nullptr) {
+    return false;
+  }
+  const bool ok = std::fwrite(data, 1, size, fp) == size;
+  std::fclose(fp);
+  return ok;
+}
+
+// 缓存比 ONNX 新才认为有效。改过 ONNX 就自动重编，不用手动删缓存。
+bool cache_is_fresh(const std::string& cache, const std::string& onnx) {
+  std::error_code ec;
+  const auto cache_time = std::filesystem::last_write_time(cache, ec);
+  if (ec) {
+    return false;
+  }
+  const auto onnx_time = std::filesystem::last_write_time(onnx, ec);
+  if (ec) {
+    return false;
+  }
+  return cache_time >= onnx_time;
+}
+
+// 用 TensorRT builder 把 ONNX 现编成序列化引擎。
+//
+// 走的是和 trtexec 一样的路径：createInferBuilder → createNetworkV2 →
+// nvonnxparser 解析 → buildSerializedNetwork。首次要几分钟，之后走缓存。
+struct PreloadedDlls {
+  std::vector<HMODULE> handles;
+  ~PreloadedDlls() {
+    for (HMODULE h : handles) {
+      if (h != nullptr) {
+        ::FreeLibrary(h);
+      }
+    }
+  }
+};
+
+void preload_builder_resources(const std::string& trt_dir, PreloadedDlls& out) {
+  std::error_code ec;
+  std::filesystem::directory_iterator it(trt_dir, ec);
+  if (ec) {
+    return;
+  }
+  for (const auto& entry : it) {
+    const std::string name = entry.path().filename().string();
+    if (!ends_with_ci(name, ".dll") || name.rfind("nvinfer_builder_resource_", 0) != 0) {
+      continue;
+    }
+    HMODULE h = ::LoadLibraryExA(entry.path().string().c_str(), nullptr,
+                                 LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (h != nullptr) {
+      out.handles.push_back(h);
+    }
+  }
+}
+
+std::string module_dir(HMODULE mod) {
+  char path[MAX_PATH] = {};
+  if (::GetModuleFileNameA(mod, path, MAX_PATH) == 0) {
+    return std::string();
+  }
+  std::string text(path);
+  const std::size_t slash = text.find_last_of("\\/");
+  return slash == std::string::npos ? std::string() : text.substr(0, slash + 1);
+}
+
+bool build_onnx_engine_internal(HMODULE trt, nvinfer1::ILogger* logger, const DetectConfig& cfg,
+                                const std::string& onnx_path, std::vector<char>& out_blob,
+                                std::string& error) {
+  auto create_builder = reinterpret_cast<CreateInferBuilderFn>(
+      ::GetProcAddress(trt, "createInferBuilder_INTERNAL"));
+  if (create_builder == nullptr) {
+    error = "TensorRT DLL 里找不到 createInferBuilder_INTERNAL";
+    return false;
+  }
+
+  // nvonnxparser 默认和 nvinfer 放在同一个目录。
+  std::string trt_dir;
+  {
+    char dll_path[MAX_PATH] = {};
+    if (::GetModuleFileNameA(trt, dll_path, MAX_PATH) == 0) {
+      error = "无法定位 nvinfer 所在目录";
+      return false;
+    }
+    std::string path(dll_path);
+    const std::size_t slash = path.find_last_of("\\/");
+    trt_dir = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+  }
+
+  // nvinfer 构建引擎时会用裸文件名 LoadLibrary("nvinfer_builder_resource_smXXX_10.dll")，
+  // 不认我们给 nvinfer 设的 LOAD_WITH_ALTERED_SEARCH_PATH，结果报 126。
+  // 抢先用完整路径加载一遍：同名模块已存在时，后续的裸名 LoadLibrary 直接命中。
+  PreloadedDlls resources;
+  preload_builder_resources(trt_dir, resources);
+
+  std::string parser_path = cfg.onnx_parser_dll;
+  if (parser_path.empty()) {
+    parser_path = trt_dir + "nvonnxparser_10.dll";
+  }
+
+  HMODULE onnx_dll =
+      ::LoadLibraryExA(parser_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  if (onnx_dll == nullptr) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "加载 %s 失败（错误码 %lu）", parser_path.c_str(),
+                  ::GetLastError());
+    error = buf;
+    return false;
+  }
+  auto create_parser = reinterpret_cast<CreateNvOnnxParserFn>(
+      ::GetProcAddress(onnx_dll, "createNvOnnxParser_INTERNAL"));
+  if (create_parser == nullptr) {
+    ::FreeLibrary(onnx_dll);
+    error = "nvonnxparser 里找不到 createNvOnnxParser_INTERNAL";
+    return false;
+  }
+
+  nvinfer1::IBuilder* builder =
+      static_cast<nvinfer1::IBuilder*>(create_builder(logger, NV_TENSORRT_VERSION));
+  if (builder == nullptr) {
+    ::FreeLibrary(onnx_dll);
+    error = "创建 TensorRT builder 失败";
+    return false;
+  }
+
+  nvinfer1::INetworkDefinition* network = builder->createNetworkV2(0);
+  if (network == nullptr) {
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "创建网络定义失败";
+    return false;
+  }
+
+  nvonnxparser::IParser* parser = static_cast<nvonnxparser::IParser*>(
+      create_parser(network, logger, NV_ONNX_PARSER_VERSION));
+  if (parser == nullptr) {
+    trt_release(network);
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "创建 ONNX parser 失败";
+    return false;
+  }
+
+  // verbosity 用 kWARNING：解析期的错误信息会经我们的 logger 打出来，
+  // 但 INFO 级的逐层信息太吵。
+  const bool parsed =
+      parser->parseFromFile(onnx_path.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING));
+  if (!parsed) {
+    std::string detail;
+    const int32_t n = parser->getNbErrors();
+    for (int32_t i = 0; i < n && i < 4; ++i) {
+      const nvonnxparser::IParserError* e = parser->getError(i);
+      if (e != nullptr && e->desc() != nullptr) {
+        detail += "\n  ";
+        detail += e->desc();
+        if (e->file() != nullptr) {
+          detail += " (";
+          detail += e->file();
+          detail += ":";
+          detail += std::to_string(e->line());
+          detail += ")";
+        }
+      }
+    }
+    trt_release(parser);
+    trt_release(network);
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "解析 ONNX 失败: " + onnx_path + detail;
+    return false;
+  }
+  trt_release(parser);
+
+  nvinfer1::IBuilderConfig* config = builder->createBuilderConfig();
+  if (config == nullptr) {
+    trt_release(network);
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "创建 builder 配置失败";
+    return false;
+  }
+  // trtexec 会对每个输入建一个 optimization profile（min=opt=max=模型声明的
+  // 形状）。少了这一步，YOLO26 里那串 NMS 相关的 shape 运算（Gather /
+  // Tile / GatherElements 反推维度）在 ShapeNodeRemover 阶段会解析失败，
+  // 报 "IElementWiseLayer /model.23/Sub: broadcast dimensions must be
+  // conformable"。所以即使形状是静态的，也必须显式给 profile。
+  nvinfer1::IOptimizationProfile* profile = builder->createOptimizationProfile();
+  if (profile == nullptr) {
+    trt_release(config);
+    trt_release(network);
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "创建 optimization profile 失败";
+    return false;
+  }
+  for (int32_t i = 0; i < network->getNbInputs(); ++i) {
+    const nvinfer1::ITensor* input = network->getInput(i);
+    if (input == nullptr) {
+      continue;
+    }
+    const nvinfer1::Dims dims = input->getDimensions();
+    const char* name = input->getName();
+    if (!profile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, dims) ||
+        !profile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, dims) ||
+        !profile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, dims)) {
+      std::string detail = "设置 optimization profile 失败（输入 ";
+      detail += name != nullptr ? name : "?";
+      detail += " 的形状含未知维度？请在 ONNX 里写死输入尺寸）";
+      trt_release(config);
+      trt_release(network);
+      trt_release(builder);
+      ::FreeLibrary(onnx_dll);
+      error = detail;
+      return false;
+    }
+  }
+  if (config->addOptimizationProfile(profile) < 0) {
+    trt_release(config);
+    trt_release(network);
+    trt_release(builder);
+    ::FreeLibrary(onnx_dll);
+    error = "添加 optimization profile 失败";
+    return false;
+  }
+
+  config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,
+                             cfg.workspace_mb * 1024ull * 1024ull);
+
+  // trtexec 默认开 TF32（`--noTF32` 才是关）。这里跟着开：不确定
+  // YOLO26 头部的 shape 运算是否依赖它，但先对齐 trtexec 的行为。
+#pragma warning(push)
+#pragma warning(disable : 4996)
+  config->setFlag(nvinfer1::BuilderFlag::kTF32);
+  // kFP16 在 10.12 之后被标了 deprecated（推荐强类型网络），但它仍然
+  // 是本插件需要的语义：FP32 网络里允许 FP16 层。这里局部屏蔽弃用警告。
+  if (cfg.build_fp16 && builder->platformHasFastFp16()) {
+    config->setFlag(nvinfer1::BuilderFlag::kFP16);
+  }
+#pragma warning(pop)
+
+  nvinfer1::IHostMemory* serialized = builder->buildSerializedNetwork(*network, *config);
+  trt_release(config);
+  trt_release(network);
+  trt_release(builder);
+  ::FreeLibrary(onnx_dll);
+
+  if (serialized == nullptr) {
+    error = "构建 TensorRT 引擎失败（细节见上面的 TensorRT 日志）";
+    return false;
+  }
+
+  out_blob.assign(static_cast<const char*>(serialized->data()),
+                  static_cast<const char*>(serialized->data()) + serialized->size());
+  trt_release(serialized);
+  if (out_blob.empty()) {
+    error = "构建出的引擎为空";
+    return false;
+  }
+
+  // 写缓存。失败不影响使用，只是下次还得重编。
+  const std::string cache = cfg.engine_cache.empty() ? onnx_path + ".engine" : cfg.engine_cache;
+  (void)write_file(cache, out_blob.data(), out_blob.size());
+
+  return true;
+}
+
+// 用 trtexec.exe 代编。
+//
+// 内置 builder 走的是「经典」构建路径，对 YOLO26 这类带内置 NMS 的模型，
+// Optimization 阶段会在 ShapeNodeRemover 里报
+//   IElementWiseLayer /model.23/Sub: broadcast dimensions must be conformable
+// 而 trtexec 走的是 compiler backend（日志里那句 "Compiler backend is used
+// during engine build."），同样的模型能正常构建。这个后端目前没有公开的
+// API 开关，所以退而求其次：直接调 trtexec。
+bool build_onnx_engine_trtexec(const DetectConfig& cfg, const std::string& trtexec_path,
+                               const std::string& onnx_path, const std::string& engine_out,
+                               std::string& error) {
+  // 命令行：trtexec --onnx=<in> --saveEngine=<out> [--fp16]
+  // 引号包住路径，避免空格（"Program Files"、"TensorRT-10.16.1.11"）。
+  std::string cmd = "\"" + trtexec_path + "\" --onnx=\"" + onnx_path + "\" --saveEngine=\"" +
+                    engine_out + "\"";
+  if (cfg.build_fp16) {
+    cmd += " --fp16";
+  }
+
+  std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+  mutable_cmd.push_back('\0');
+
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!::CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "启动 trtexec 失败（错误码 %lu）", ::GetLastError());
+    error = buf;
+    return false;
+  }
+  ::WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  ::GetExitCodeProcess(pi.hProcess, &exit_code);
+  ::CloseHandle(pi.hThread);
+  ::CloseHandle(pi.hProcess);
+
+  if (exit_code != 0) {
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), "trtexec 返回 %lu，构建失败: %s",
+                  static_cast<unsigned long>(exit_code), cmd.c_str());
+    error = buf;
+    return false;
+  }
+  return true;
+}
+
+// 先试内置 builder，失败再退回 trtexec.exe。
+//
+// 内置路径在纯 API 层面最干净，但对带内置 NMS 的模型会撞上 classic
+// builder 的 shape 推断限制；trtexec 用的是 compiler backend，没有这个问题。
+bool build_onnx_engine(HMODULE trt, nvinfer1::ILogger* logger, const DetectConfig& cfg,
+                       const std::string& onnx_path, std::vector<char>& out_blob,
+                       std::string& error) {
+  std::string internal_error;
+  if (build_onnx_engine_internal(trt, logger, cfg, onnx_path, out_blob, internal_error)) {
+    return true;
+  }
+
+  const std::string trtexec =
+      cfg.trtexec_path.empty() ? module_dir(trt) + "trtexec.exe" : cfg.trtexec_path;
+  const std::string cache =
+      cfg.engine_cache.empty() ? onnx_path + ".engine" : cfg.engine_cache;
+
+  if (logger != nullptr) {
+    const std::string note =
+        "yolo_det: 内置构建失败，改用 trtexec 重建（" + internal_error + "）";
+    logger->log(nvinfer1::ILogger::Severity::kWARNING, note.c_str());
+  }
+
+  std::string trtexec_error;
+  if (build_onnx_engine_trtexec(cfg, trtexec, onnx_path, cache, trtexec_error) &&
+      read_file(cache, out_blob, trtexec_error)) {
+    return true;
+  }
+
+  error = "构建 ONNX 失败。内置 builder: " + internal_error +
+          "；trtexec 回退: " + trtexec_error;
+  return false;
 }
 
 }  // namespace
@@ -226,28 +623,6 @@ bool YoloDetector::init(const DetectConfig& config, LogFn log, std::string& erro
     return false;
   }
 
-  // 读引擎文件
-  FILE* fp = nullptr;
-  if (::fopen_s(&fp, config.engine_path.c_str(), "rb") != 0 || fp == nullptr) {
-    error = "打不开引擎文件: " + config.engine_path;
-    return false;
-  }
-  std::fseek(fp, 0, SEEK_END);
-  const long size = std::ftell(fp);
-  std::fseek(fp, 0, SEEK_SET);
-  if (size <= 0) {
-    std::fclose(fp);
-    error = "引擎文件为空: " + config.engine_path;
-    return false;
-  }
-  std::vector<char> blob(static_cast<std::size_t>(size));
-  const bool read_ok = std::fread(blob.data(), 1, blob.size(), fp) == blob.size();
-  std::fclose(fp);
-  if (!read_ok) {
-    error = "读取引擎文件失败: " + config.engine_path;
-    return false;
-  }
-
   impl_->logger = new TrtLogger(log);
   impl_->runtime =
       static_cast<nvinfer1::IRuntime*>(create_runtime(impl_->logger, NV_TENSORRT_VERSION));
@@ -256,9 +631,59 @@ bool YoloDetector::init(const DetectConfig& config, LogFn log, std::string& erro
     return false;
   }
 
+  // .onnx 走现编路径：有可用缓存就直接反序列化，没有就现场 build。
+  // 引擎和 TRT/GPU 不匹配时反序列化会失败，这时也自动重编一次——
+  // 升级 TensorRT 或换显卡之后不需要手动删缓存。
+  const bool is_onnx = ends_with_ci(config.engine_path, ".onnx");
+  std::vector<char> blob;
+  if (!is_onnx) {
+    if (!read_file(config.engine_path, blob, error)) {
+      return false;
+    }
+  } else {
+    const std::string cache =
+        config.engine_cache.empty() ? config.engine_path + ".engine" : config.engine_cache;
+    const bool use_cache =
+        !config.force_rebuild && cache_is_fresh(cache, config.engine_path) &&
+        read_file(cache, blob, error);
+    if (!use_cache) {
+      error.clear();
+      if (log != nullptr) {
+        log(2, "yolo_det: 首次加载 ONNX，正在构建 TensorRT 引擎（可能需要几分钟）…");
+      }
+      if (!build_onnx_engine(impl_->nvinfer_dll, impl_->logger, config, config.engine_path, blob,
+                             error)) {
+        return false;
+      }
+      if (log != nullptr) {
+        const std::string msg = "yolo_det: 引擎已构建并缓存到 " + cache;
+        log(2, msg.c_str());
+      }
+    }
+  }
+
   impl_->engine = impl_->runtime->deserializeCudaEngine(blob.data(), blob.size());
+
+  // 缓存可能是别台机器 / 旧版 TensorRT 编的：反序列化失败就重编一次。
+  if (impl_->engine == nullptr && is_onnx) {
+    if (log != nullptr) {
+      log(3, "yolo_det: 缓存引擎不可用，重新构建");
+    }
+    if (!build_onnx_engine(impl_->nvinfer_dll, impl_->logger, config, config.engine_path, blob,
+                           error)) {
+      return false;
+    }
+    impl_->engine = impl_->runtime->deserializeCudaEngine(blob.data(), blob.size());
+  }
+
   if (impl_->engine == nullptr) {
-    error = "反序列化引擎失败（引擎与本机 TensorRT / GPU 不匹配？）";
+    if (ends_with_ci(config.engine_path, ".onnx")) {
+      error = "反序列化引擎失败：ONNX 已重新构建但仍无法加载，请检查 TensorRT 日志";
+    } else {
+      error =
+          "反序列化引擎失败（文件可能不是 TensorRT 引擎，或与本机 TensorRT / GPU 不匹配）。"
+          "如果这是 .onnx，请改传 .onnx 路径由插件自动构建，或用 trtexec 预转换";
+    }
     return false;
   }
 

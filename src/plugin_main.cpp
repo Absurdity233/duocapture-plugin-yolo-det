@@ -13,7 +13,7 @@
 //   chw   [1, 4+nc, N]      —— 原始输出，插件自己挑类 + NMS
 //
 // 配置（--plugin-config，逗号分隔的 key=value）：
-//   engine=<path>            .engine 文件（必填）
+//   engine=<path>            .engine 或 .onnx（必填）。.onnx 首次加载时现编并缓存
 //   trt=<path>               nvinfer_10.dll 完整路径（必填）
 //   input=images             输入张量名
 //   output=output0           输出张量名，空 = 自动
@@ -355,6 +355,12 @@ int create(const DuoPluginHostServices* host, const char* config, void** out_ins
   dc.num_classes = std::atoi(get("num_classes", "0").c_str());
   dc.device_index = std::atoi(get("device", "0").c_str());
   dc.keep_classes = parse_int_list(get("classes", ""));
+  dc.onnx_parser_dll = get("onnxparser", "");
+  dc.trtexec_path = get("trtexec", "");
+  dc.build_fp16 = std::atoi(get("fp16", "1").c_str()) != 0;
+  dc.workspace_mb = static_cast<std::size_t>(std::max(128, std::atoi(get("workspace", "2048").c_str())));
+  dc.engine_cache = get("cache", "");
+  dc.force_rebuild = std::atoi(get("rebuild", "0").c_str()) != 0;
 
   self->class_names = parse_str_list(get("names", ""));
   self->every = std::max(1, std::atoi(get("every", "1").c_str()));

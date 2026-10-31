@@ -28,7 +28,7 @@ struct Detection {
 
 struct DetectConfig {
   std::string tensorrt_dll;  // nvinfer_10.dll 的完整路径
-  std::string engine_path;   // .engine 文件
+  std::string engine_path;   // .engine；或 .onnx（首次加载时现编，结果缓存）
   std::string input_name = "images";
   std::string output_name;   // 空 = 自动取第一个输出
   int num_classes = 0;       // 0 = 从输出维度推断（仅 chw 布局需要）
@@ -37,6 +37,14 @@ struct DetectConfig {
   float conf_threshold = 0.45f;
   float iou_threshold = 0.45f;
   std::vector<int> keep_classes;  // 空 = 全部保留
+
+  // ---- ONNX 现编（engine_path 以 .onnx 结尾时才用）---------------------
+  std::string onnx_parser_dll;  // 空 = nvinfer 同目录下的 nvonnxparser_10.dll
+  std::string trtexec_path;     // 空 = nvinfer 同目录下的 trtexec.exe（回退用）
+  bool build_fp16 = true;       // 构建时允许 FP16 层
+  std::size_t workspace_mb = 2048;
+  std::string engine_cache;     // 空 = <onnx 路径>.engine
+  bool force_rebuild = false;   // 忽略缓存，强制重编
 };
 
 // TensorRT 自己的日志（反序列化、执行期警告）。插件在 create() 里绑定，
